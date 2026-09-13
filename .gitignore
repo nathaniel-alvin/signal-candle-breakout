@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 *.env
+config/
 
 # Python Bytecode & Cache
 __pycache__/

@@ -142,6 +142,28 @@ class Settings(BaseSettings):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
 
+    # Data freshness
+    max_candle_age_seconds: int = 3600  # 1 hour default
+    # Per-symbol circuit breaker
+    max_consecutive_failures: int = 5
+
+    def model_post_init(self, __context) -> None:
+        """Validate required secrets are present when notifiers are enabled."""
+        self._validate_notifier_secrets()
+
+    def _validate_notifier_secrets(self) -> None:
+        errors = []
+        if self.notifications.telegram.enabled:
+            if not self.get_telegram_token():
+                errors.append("TELEGRAM_BOT_TOKEN required but not set")
+            if not self.get_telegram_chat_id():
+                errors.append("TELEGRAM_CHAT_ID required but not set")
+        if self.notifications.discord.enabled:
+            if not self.get_discord_webhook():
+                errors.append("DISCORD_WEBHOOK_URL required but not set")
+        if errors:
+            raise ValueError("Configuration error: " + "; ".join(errors))
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Settings":
         """Load settings from YAML file, then override with env vars."""

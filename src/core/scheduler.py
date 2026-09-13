@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Callable
 
 from src.core.config import get_settings
 
@@ -110,9 +110,13 @@ class CandleScheduler:
 
         return sleep_duration
 
-    def sleep_until_next_candle(self) -> float:
+    def sleep_until_next_candle(self, shutdown_check: Optional[Callable[[], bool]] = None) -> float:
         """
-        Blocking sleep until next candle close + buffer.
+        Blocking sleep until next candle close + buffer, with optional interrupt check.
+
+        Args:
+            shutdown_check: Optional callable that returns True if shutdown requested.
+                           Called periodically during sleep to allow early exit.
 
         Returns:
             Actual sleep duration in seconds.
@@ -125,8 +129,18 @@ class CandleScheduler:
             f"({datetime.fromtimestamp(next_close, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC)"
         )
 
-        time.sleep(sleep_duration)
-        return sleep_duration
+        # Sleep in small chunks to allow interrupt checking
+        chunk_size = min(10.0, sleep_duration)  # Max 10s chunks
+        elapsed = 0.0
+        while elapsed < sleep_duration:
+            if shutdown_check and shutdown_check():
+                logger.debug("Sleep interrupted by shutdown signal")
+                break
+            chunk = min(chunk_size, sleep_duration - elapsed)
+            time.sleep(chunk)
+            elapsed += chunk
+
+        return elapsed
 
     async def async_sleep_until_next_candle(self) -> float:
         """
@@ -158,9 +172,10 @@ class CandleScheduler:
         )
 
 
-def create_scheduler_from_config() -> CandleScheduler:
+def create_scheduler_from_config(settings: Optional["Settings"] = None) -> CandleScheduler:
     """Create scheduler from global config."""
-    settings = get_settings()
+    from src.core.config import get_settings
+    settings = settings or get_settings()
     return CandleScheduler(
         timeframe=settings.trading.timeframe,
         buffer_seconds=settings.scheduler.buffer_seconds,

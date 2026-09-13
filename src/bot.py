@@ -30,11 +30,16 @@ class SignalBot:
         self.state_manager = StateManager(
             persist_file=self.settings.state.persist_file,
             persist_enabled=self.settings.state.persist_enabled,
+            settings=self.settings,
         )
-        self.scheduler = create_scheduler_from_config()
-        self.fetcher = create_fetcher_from_config()
-        self.strategy = create_strategy_from_config()
+        self.scheduler = create_scheduler_from_config(settings=self.settings)
+        self.fetcher = create_fetcher_from_config(settings=self.settings)
+        self.strategy = create_strategy_from_config(settings=self.settings)
         self.notification_manager = NotificationManager()
+
+        # Per-symbol circuit breaker: track consecutive failures
+        self._symbol_failures: Dict[str, int] = {s: 0 for s in self.settings.trading.symbols}
+        self._disabled_symbols: set = set()
 
         # Setup notifiers
         self._setup_notifiers()
@@ -48,12 +53,12 @@ class SignalBot:
     def _setup_notifiers(self) -> None:
         """Initialize notification channels from config."""
         # Telegram
-        telegram = create_telegram_notifier_from_config()
+        telegram = create_telegram_notifier_from_config(settings=self.settings)
         if telegram:
             self.notification_manager.add_notifier(telegram)
 
         # Discord
-        discord = create_discord_notifier_from_config()
+        discord = create_discord_notifier_from_config(settings=self.settings)
         if discord:
             self.notification_manager.add_notifier(discord)
 
@@ -119,24 +124,33 @@ class SignalBot:
                 logger.error(f"Error in main loop iteration: {e}")
                 self._send_error_notification(f"Main loop error: {e}")
 
-            # Sleep until next candle
+            # Sleep until next candle (interruptible)
             if self.running and not self._shutdown_requested:
-                self.scheduler.sleep_until_next_candle()
+                self.scheduler.sleep_until_next_candle(
+                    shutdown_check=lambda: self._shutdown_requested
+                )
 
     def _process_symbol(self, symbol: str) -> None:
         """Process a single symbol: fetch data, evaluate strategy, send signals."""
+        # Skip disabled symbols
+        if symbol in self._disabled_symbols:
+            logger.debug(f"Skipping disabled symbol: {symbol}")
+            return
+
         logger.debug(f"Processing {symbol}...")
 
         try:
-            # Fetch market data
+            # Fetch market data with freshness check
             df = self.fetcher.fetch_ohlcv_df(
                 symbol=symbol,
                 timeframe=self.settings.trading.timeframe,
                 limit=self.settings.trading.fetch_limit,
+                max_candle_age_seconds=self.settings.max_candle_age_seconds,
             )
 
             if df.empty:
                 logger.warning(f"No data received for {symbol}")
+                self._record_failure(symbol)
                 return
 
             # Get latest complete candle timestamp
@@ -201,8 +215,38 @@ class SignalBot:
                 )
                 logger.debug(f"No signal for {symbol}")
 
+            # Success - reset failure counter
+            self._record_success(symbol)
+
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
+            self._record_failure(symbol)
+
+    def _record_success(self, symbol: str) -> None:
+        """Reset failure counter on successful processing."""
+        if self._symbol_failures.get(symbol, 0) > 0:
+            logger.debug(f"Symbol {symbol} recovered after {self._symbol_failures[symbol]} failures")
+        self._symbol_failures[symbol] = 0
+
+    def _record_failure(self, symbol: str) -> None:
+        """Track consecutive failures; disable symbol if threshold exceeded."""
+        self._symbol_failures[symbol] = self._symbol_failures.get(symbol, 0) + 1
+        failures = self._symbol_failures[symbol]
+        logger.warning(f"Symbol {symbol} failure #{failures}")
+
+        if failures >= self.settings.max_consecutive_failures:
+            self._disabled_symbols.add(symbol)
+            logger.error(
+                f"Symbol {symbol} disabled after {failures} consecutive failures. "
+                f"Max allowed: {self.settings.max_consecutive_failures}. "
+                f"Restart bot or reload config to re-enable."
+            )
+            # Send notification about disabled symbol
+            self.notification_manager.send_message(
+                f"⚠️ **Symbol Disabled**\n"
+                f"`{symbol}` disabled after {failures} consecutive failures. "
+                f"Check logs and restart to re-enable."
+            )
 
     def _send_startup_notifications(self) -> None:
         """Send startup notifications to all channels."""
@@ -258,6 +302,7 @@ class SignalBot:
                     symbol=symbol,
                     timeframe=self.settings.trading.timeframe,
                     limit=self.settings.trading.fetch_limit,
+                    max_candle_age_seconds=self.settings.max_candle_age_seconds,
                 )
                 if not df.empty:
                     signal = self.strategy.evaluate(df, symbol, self.settings.trading.timeframe)

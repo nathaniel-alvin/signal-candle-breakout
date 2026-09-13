@@ -115,9 +115,10 @@ class TelegramNotifier(BaseNotifier):
         return self.send_message(message)
 
 
-def create_telegram_notifier_from_config() -> Optional[TelegramNotifier]:
+def create_telegram_notifier_from_config(settings: Optional["Settings"] = None) -> Optional[TelegramNotifier]:
     """Create Telegram notifier from global config."""
-    settings = get_settings()
+    from src.core.config import get_settings
+    settings = settings or get_settings()
     telegram_config = settings.notifications.telegram
 
     if not telegram_config.enabled:

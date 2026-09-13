@@ -69,8 +69,14 @@ class ActiveTrade:
 class StateManager:
     """Thread-safe state manager with JSON persistence."""
 
-    def __init__(self, persist_file: Optional[str] = None, persist_enabled: bool = True):
-        self.settings = get_settings()
+    def __init__(
+        self,
+        persist_file: Optional[str] = None,
+        persist_enabled: bool = True,
+        settings: Optional["Settings"] = None
+    ):
+        from src.core.config import get_settings
+        self.settings = settings or get_settings()
         self.persist_enabled = persist_enabled
         self.persist_file = Path(persist_file or self.settings.state.persist_file)
         self._lock = threading.RLock()

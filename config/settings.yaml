@@ -11,7 +11,7 @@ exchange:
   # api_secret: ""
   # Rate limit handling
   enable_rate_limit: true
-  timeout: 30000  # ms
+  timeout: 30000 # ms
 
 # ============================================
 # TRADING PARAMETERS
@@ -19,11 +19,12 @@ exchange:
 trading:
   # Symbols to monitor (Binance format: BASE/QUOTE)
   symbols:
-    - "BTC/USDT"
-    - "ETH/USDT"
-    - "BNB/USDT"
-    - "SOL/USDT"
-    - "XRP/USDT"
+    - "PAXG/USDT"
+    # - "BTC/USDT"
+    # - "ETH/USDT"
+    # - "BNB/USDT"
+    # - "SOL/USDT"
+    # - "XRP/USDT"
 
   # Timeframe for candles (ccxt format: 1m, 5m, 15m, 30m, 1h, 4h, 1d)
   timeframe: "1h"
@@ -36,13 +37,13 @@ trading:
 # ============================================
 strategy:
   # 1. Strong Body: Real body >= X% of full candle range
-  strong_body_pct: 0.75  # 75%
+  strong_body_pct: 0.75 # 75%
 
   # 2. Volatility Expansion: Candle range >= X * 14-period SMA of ranges
   volatility_multiplier: 1.2
 
   # 3. Base Breakout Lookback Periods
-  breakout_lookback: 20  # Previous N candles for high/low
+  breakout_lookback: 20 # Previous N candles for high/low
 
   # 4. Indicators Periods
   atr_period: 14
@@ -95,32 +96,32 @@ notifications:
   telegram:
     enabled: true
     # Set via environment variables: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-    # bot_token: ""
-    # chat_id: ""
+    bot_token: "8885902443:AAFzItAVFRkGt4Scjo5VwN_yZUHVpOUFn3g"
+    chat_id: "8510142912"
     parse_mode: "Markdown"
-    timeout: 10  # seconds
+    timeout: 10 # seconds
 
   discord:
-    enabled: true
+    enabled: false
     # Set via environment variable: DISCORD_WEBHOOK_URL
     # webhook_url: ""
-    timeout: 10  # seconds
+    timeout: 10 # seconds
     # Embed color (decimal)
-    embed_color_buy: 3066993    # Green
-    embed_color_sell: 15158332  # Red
-    embed_color_info: 3447003   # Blue
+    embed_color_buy: 3066993 # Green
+    embed_color_sell: 15158332 # Red
+    embed_color_info: 3447003 # Blue
 
 # ============================================
 # LOGGING SETTINGS
 # ============================================
 logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  level: "INFO" # DEBUG, INFO, WARNING, ERROR
   format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
   date_format: "%Y-%m-%d %H:%M:%S"
   # File logging
   file_enabled: true
   file_path: "logs/bot.log"
-  file_max_bytes: 10485760  # 10 MB
+  file_max_bytes: 10485760 # 10 MB
   file_backup_count: 5
   # Console logging
   console_enabled: true
@@ -130,7 +131,8 @@ logging:
 # ============================================
 retry:
   max_attempts: 3
-  base_delay: 1.0  # seconds
-  max_delay: 60.0  # seconds
+  base_delay: 1.0 # seconds
+  max_delay: 60.0 # seconds
   exponential_base: 2
   jitter: true
+

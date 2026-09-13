@@ -2,6 +2,7 @@
 Discord Webhook notification implementation with rich embeds.
 """
 import logging
+import time
 import requests
 from typing import Optional
 from datetime import datetime
@@ -33,25 +34,58 @@ class DiscordNotifier(BaseNotifier):
         self.embed_color_info = embed_color_info
 
     def _send_webhook(self, payload: dict) -> NotificationResult:
-        """Send payload to Discord webhook."""
-        try:
-            response = requests.post(
-                self.webhook_url,
-                json=payload,
-                timeout=self.timeout,
-                headers={"Content-Type": "application/json"}
-            )
-            response.raise_for_status()
-            return NotificationResult(True, "Message sent successfully")
+        """Send payload to Discord webhook with rate limit handling."""
+        max_retries = 3
+        base_delay = 1.0
 
-        except requests.exceptions.Timeout:
-            return NotificationResult(False, "", "Request timeout")
-        except requests.exceptions.HTTPError as e:
-            if response.status_code == 429:
-                return NotificationResult(False, "", "Rate limited")
-            return NotificationResult(False, "", f"HTTP error: {e}")
-        except requests.exceptions.RequestException as e:
-            return NotificationResult(False, "", f"Network error: {e}")
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    self.webhook_url,
+                    json=payload,
+                    timeout=self.timeout,
+                    headers={"Content-Type": "application/json"}
+                )
+
+                if response.status_code == 429:
+                    # Rate limited - respect Retry-After header
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            delay = base_delay * (2 ** attempt)
+                    else:
+                        delay = base_delay * (2 ** attempt)
+
+                    delay = min(delay, 60.0)  # Cap at 60 seconds
+                    logger.warning(f"Discord rate limited (attempt {attempt + 1}/{max_retries}), waiting {delay:.1f}s")
+                    time.sleep(delay)
+                    continue
+
+                response.raise_for_status()
+                return NotificationResult(True, "Message sent successfully")
+
+            except requests.exceptions.Timeout:
+                if attempt == max_retries - 1:
+                    return NotificationResult(False, "", "Request timeout after retries")
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Discord timeout (attempt {attempt + 1}/{max_retries}), retrying in {delay:.1f}s")
+                time.sleep(delay)
+            except requests.exceptions.HTTPError as e:
+                if attempt == max_retries - 1:
+                    return NotificationResult(False, "", f"HTTP error: {e}")
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Discord HTTP error (attempt {attempt + 1}/{max_retries}): {e}, retrying in {delay:.1f}s")
+                time.sleep(delay)
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries - 1:
+                    return NotificationResult(False, "", f"Network error: {e}")
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Discord network error (attempt {attempt + 1}/{max_retries}): {e}, retrying in {delay:.1f}s")
+                time.sleep(delay)
+
+        return NotificationResult(False, "", "Max retries exceeded")
 
     def send_signal(self, signal: BreakoutSignal) -> NotificationResult:
         """Send breakout signal as rich embed to Discord."""
@@ -212,9 +246,10 @@ class DiscordNotifier(BaseNotifier):
         )
 
 
-def create_discord_notifier_from_config() -> Optional[DiscordNotifier]:
+def create_discord_notifier_from_config(settings: Optional["Settings"] = None) -> Optional[DiscordNotifier]:
     """Create Discord notifier from global config."""
-    settings = get_settings()
+    from src.core.config import get_settings
+    settings = settings or get_settings()
     discord_config = settings.notifications.discord
 
     if not discord_config.enabled:

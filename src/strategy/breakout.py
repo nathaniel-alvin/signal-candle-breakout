@@ -304,9 +304,10 @@ class BreakoutStrategy:
         return df
 
 
-def create_strategy_from_config() -> BreakoutStrategy:
+def create_strategy_from_config(settings: Optional["Settings"] = None) -> BreakoutStrategy:
     """Create strategy from global config."""
-    settings = get_settings()
+    from src.core.config import get_settings
+    settings = settings or get_settings()
     return BreakoutStrategy(
         strong_body_pct=settings.strategy.strong_body_pct,
         volatility_multiplier=settings.strategy.volatility_multiplier,

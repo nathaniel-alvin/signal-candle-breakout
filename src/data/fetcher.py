@@ -111,6 +111,7 @@ class MarketDataFetcher:
         symbol: str,
         timeframe: str = "1h",
         limit: int = 100,
+        max_candle_age_seconds: int = 3600,
     ) -> pd.DataFrame:
         """
         Fetch OHLCV data as a pandas DataFrame with proper types.
@@ -119,10 +120,14 @@ class MarketDataFetcher:
             symbol: Trading pair
             timeframe: Candle timeframe
             limit: Number of candles
+            max_candle_age_seconds: Max age of latest complete candle before rejecting as stale
 
         Returns:
             DataFrame with columns: timestamp, open, high, low, close, volume
             Index is DatetimeIndex (UTC)
+
+        Raises:
+            ValueError: If data is stale, empty, or invalid
         """
         ohlcv = self.fetch_ohlcv(symbol, timeframe, limit)
 
@@ -145,6 +150,24 @@ class MarketDataFetcher:
         # Drop any rows with NaN
         df.dropna(inplace=True)
 
+        if df.empty:
+            raise ValueError(f"All rows dropped due to NaN for {symbol} {timeframe}")
+
+        # Check data freshness: latest complete candle is iloc[-2]
+        if len(df) >= 2:
+            latest_complete_ts = df.index[-2]
+            age_seconds = (pd.Timestamp.now(tz="UTC") - latest_complete_ts).total_seconds()
+            if age_seconds > max_candle_age_seconds:
+                raise ValueError(
+                    f"Stale data for {symbol} {timeframe}: latest complete candle is "
+                    f"{age_seconds:.0f}s old (max allowed: {max_candle_age_seconds}s)"
+                )
+            logger.debug(
+                f"Data freshness OK for {symbol}: latest complete candle age={age_seconds:.0f}s"
+            )
+        else:
+            raise ValueError(f"Insufficient candles for freshness check: {len(df)} rows")
+
         logger.debug(f"Fetched {len(df)} candles for {symbol} {timeframe}")
         return df
 
@@ -153,6 +176,7 @@ class MarketDataFetcher:
         symbols: List[str],
         timeframe: str = "1h",
         limit: int = 100,
+        max_candle_age_seconds: int = 3600,
     ) -> Dict[str, pd.DataFrame]:
         """
         Fetch data for multiple symbols sequentially.
@@ -161,14 +185,17 @@ class MarketDataFetcher:
             symbols: List of trading pairs
             timeframe: Candle timeframe
             limit: Number of candles per symbol
+            max_candle_age_seconds: Max age of latest complete candle before rejecting as stale
 
         Returns:
-            Dict mapping symbol to DataFrame
+            Dict mapping symbol to DataFrame (empty DataFrame on error)
         """
         results = {}
         for symbol in symbols:
             try:
-                results[symbol] = self.fetch_ohlcv_df(symbol, timeframe, limit)
+                results[symbol] = self.fetch_ohlcv_df(
+                    symbol, timeframe, limit, max_candle_age_seconds
+                )
             except Exception as e:
                 logger.error(f"Failed to fetch {symbol}: {e}")
                 results[symbol] = pd.DataFrame()  # Empty DataFrame on error
@@ -207,9 +234,10 @@ class MarketDataFetcher:
         logger.debug("Exchange connection closed")
 
 
-def create_fetcher_from_config() -> MarketDataFetcher:
+def create_fetcher_from_config(settings: Optional["Settings"] = None) -> MarketDataFetcher:
     """Create fetcher from global config."""
-    settings = get_settings()
+    from src.core.config import get_settings
+    settings = settings or get_settings()
     return MarketDataFetcher(
         exchange_name=settings.exchange.name,
         api_key=settings.get_binance_api_key(),
