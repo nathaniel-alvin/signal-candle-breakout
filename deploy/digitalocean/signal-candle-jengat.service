@@ -1,0 +1,36 @@
+[Unit]
+Description=Signal Candle Jengat - Crypto Breakout Signal Bot
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=signalbot
+Group=signalbot
+WorkingDirectory=/opt/signal-candle-jengat
+EnvironmentFile=/opt/signal-candle-jengat/.env
+ExecStartPre=/usr/bin/docker pull signal-candle-jengat:latest
+ExecStart=/usr/bin/docker run --rm \
+    --name signal-candle-jengat \
+    --env-file /opt/signal-candle-jengat/.env \
+    -v /opt/signal-candle-jengat/data:/app/data \
+    -v /opt/signal-candle-jengat/logs:/app/logs \
+    -v /opt/signal-candle-jengat/config:/app/config:ro \
+    signal-candle-jengat:latest
+ExecStop=/usr/bin/docker stop signal-candle-jengat
+TimeoutStartSec=120
+TimeoutStopSec=30
+Restart=always
+RestartSec=10
+
+# Resource limits
+MemoryLimit=512M
+CPUQuota=50%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=signal-candle-jengat
+
+[Install]
+WantedBy=multi-user.target

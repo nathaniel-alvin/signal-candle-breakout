@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  signal-bot:
+    build:
+      context: ..
+      dockerfile: ../Dockerfile
+    container_name: signal-candle-jengat
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    # Resource limits (adjust based on droplet size)
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    # Health check (optional - checks if process is alive)
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "python main.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Log rotation sidecar
+  # logrotate:
+  #   image: blacklabelops/logrotate
+  #   container_name: signal-bot-logrotate
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./logs:/logs:rw
+  #   environment:
+  #     - LOGROTATE_CRON=0 0 * * *
+  #     - LOGROTATE_MAXSIZE=10M
+  #     - LOGROTATE_MAXAGE=30
+  #     - LOGROTATE_COMPRESS=true

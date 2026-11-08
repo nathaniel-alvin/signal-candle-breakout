@@ -100,12 +100,13 @@ def run_live_bot(config_path: str, log_level: str = None, run_once: bool = False
     if run_once:
         logger.info("Running single iteration...")
         results = bot.run_once()
-        for symbol, signal in results.items():
-            if signal and signal.is_valid():
-                print(f"\n{symbol}: {signal.signal_type.value}")
-                print(signal.levels.format_for_message())
-            else:
-                print(f"\n{symbol}: No signal")
+        for symbol, tf_results in results.items():
+            for timeframe, signal in tf_results.items():
+                if signal and signal.is_valid():
+                    print(f"\n{symbol} [{timeframe}]: {signal.signal_type.value}")
+                    print(signal.levels.format_for_message())
+                else:
+                    print(f"\n{symbol} [{timeframe}]: No signal")
         bot.stop()
     else:
         bot.start()

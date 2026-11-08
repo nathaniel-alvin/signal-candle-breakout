@@ -15,10 +15,25 @@ from src.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _make_key(symbol: str, timeframe: str) -> str:
+    """Create a composite key for symbol + timeframe."""
+    return f"{symbol}:{timeframe}"
+
+
+def _parse_key(key: str) -> tuple[str, str]:
+    """Parse composite key back to symbol and timeframe."""
+    parts = key.split(":", 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    # Legacy format: no timeframe, assume primary timeframe
+    return key, "1h"
+
+
 @dataclass
 class CandleState:
     """State for a single symbol's last processed candle."""
     symbol: str
+    timeframe: str
     last_candle_timestamp: int  # milliseconds
     last_candle_close: float
     updated_at: str  # ISO format
@@ -28,6 +43,9 @@ class CandleState:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CandleState":
+        # Handle legacy data without timeframe
+        if "timeframe" not in data:
+            data["timeframe"] = "1h"
         return cls(**data)
 
 
@@ -35,6 +53,7 @@ class CandleState:
 class ActiveTrade:
     """Active trade tracking for consecutive signal prevention."""
     symbol: str
+    timeframe: str
     side: str  # "BUY" or "SELL"
     entry_price: float
     stop_loss: float
@@ -49,6 +68,9 @@ class ActiveTrade:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ActiveTrade":
+        # Handle legacy data without timeframe
+        if "timeframe" not in data:
+            data["timeframe"] = "1h"
         return cls(**data)
 
     def check_exit(self, current_price: float) -> Optional[str]:
@@ -80,8 +102,8 @@ class StateManager:
         self.persist_enabled = persist_enabled
         self.persist_file = Path(persist_file or self.settings.state.persist_file)
         self._lock = threading.RLock()
-        self._candle_states: Dict[str, CandleState] = {}
-        self._active_trades: Dict[str, ActiveTrade] = {}
+        self._candle_states: Dict[str, CandleState] = {}  # key: "symbol:timeframe"
+        self._active_trades: Dict[str, ActiveTrade] = {}  # key: "symbol:timeframe"
 
         # Ensure parent directory exists
         self.persist_file.parent.mkdir(parents=True, exist_ok=True)
@@ -100,12 +122,12 @@ class StateManager:
                 data = json.load(f)
 
             # Load candle states
-            for symbol, state_data in data.get("candle_states", {}).items():
-                self._candle_states[symbol] = CandleState.from_dict(state_data)
+            for key, state_data in data.get("candle_states", {}).items():
+                self._candle_states[key] = CandleState.from_dict(state_data)
 
             # Load active trades
-            for symbol, trade_data in data.get("active_trades", {}).items():
-                self._active_trades[symbol] = ActiveTrade.from_dict(trade_data)
+            for key, trade_data in data.get("active_trades", {}).items():
+                self._active_trades[key] = ActiveTrade.from_dict(trade_data)
 
             logger.info(
                 f"Loaded state: {len(self._candle_states)} candle states, "
@@ -124,12 +146,12 @@ class StateManager:
         try:
             data = {
                 "candle_states": {
-                    symbol: state.to_dict()
-                    for symbol, state in self._candle_states.items()
+                    key: state.to_dict()
+                    for key, state in self._candle_states.items()
                 },
                 "active_trades": {
-                    symbol: trade.to_dict()
-                    for symbol, trade in self._active_trades.items()
+                    key: trade.to_dict()
+                    for key, trade in self._active_trades.items()
                 },
                 "saved_at": datetime.utcnow().isoformat(),
             }
@@ -148,32 +170,36 @@ class StateManager:
     # Candle State Methods
     # ============================================
 
-    def get_last_candle_timestamp(self, symbol: str) -> Optional[int]:
-        """Get the timestamp of the last processed candle for a symbol."""
+    def get_last_candle_timestamp(self, symbol: str, timeframe: str) -> Optional[int]:
+        """Get the timestamp of the last processed candle for a symbol/timeframe."""
         with self._lock:
-            state = self._candle_states.get(symbol)
+            key = _make_key(symbol, timeframe)
+            state = self._candle_states.get(key)
             return state.last_candle_timestamp if state else None
 
     def update_candle_state(
         self,
         symbol: str,
+        timeframe: str,
         timestamp: int,
         close_price: float
     ) -> None:
-        """Update the last processed candle for a symbol."""
+        """Update the last processed candle for a symbol/timeframe."""
         with self._lock:
-            self._candle_states[symbol] = CandleState(
+            key = _make_key(symbol, timeframe)
+            self._candle_states[key] = CandleState(
                 symbol=symbol,
+                timeframe=timeframe,
                 last_candle_timestamp=timestamp,
                 last_candle_close=close_price,
                 updated_at=datetime.utcnow().isoformat(),
             )
             self._save()
 
-    def is_new_candle(self, symbol: str, timestamp: int) -> bool:
-        """Check if the given timestamp represents a new candle."""
+    def is_new_candle(self, symbol: str, timeframe: str, timestamp: int) -> bool:
+        """Check if the given timestamp represents a new candle for symbol/timeframe."""
         with self._lock:
-            last_ts = self.get_last_candle_timestamp(symbol)
+            last_ts = self.get_last_candle_timestamp(symbol, timeframe)
             if last_ts is None:
                 return True
             return timestamp > last_ts
@@ -182,19 +208,22 @@ class StateManager:
     # Active Trade Methods
     # ============================================
 
-    def get_active_trade(self, symbol: str) -> Optional[ActiveTrade]:
-        """Get active trade for a symbol."""
+    def get_active_trade(self, symbol: str, timeframe: str) -> Optional[ActiveTrade]:
+        """Get active trade for a symbol/timeframe."""
         with self._lock:
-            return self._active_trades.get(symbol)
+            key = _make_key(symbol, timeframe)
+            return self._active_trades.get(key)
 
-    def has_active_trade(self, symbol: str) -> bool:
-        """Check if there's an active trade for a symbol."""
+    def has_active_trade(self, symbol: str, timeframe: str) -> bool:
+        """Check if there's an active trade for a symbol/timeframe."""
         with self._lock:
-            return symbol in self._active_trades
+            key = _make_key(symbol, timeframe)
+            return key in self._active_trades
 
     def set_active_trade(
         self,
         symbol: str,
+        timeframe: str,
         side: str,
         entry_price: float,
         stop_loss: float,
@@ -205,8 +234,10 @@ class StateManager:
     ) -> None:
         """Record a new active trade."""
         with self._lock:
-            self._active_trades[symbol] = ActiveTrade(
+            key = _make_key(symbol, timeframe)
+            self._active_trades[key] = ActiveTrade(
                 symbol=symbol,
+                timeframe=timeframe,
                 side=side,
                 entry_price=entry_price,
                 stop_loss=stop_loss,
@@ -217,36 +248,38 @@ class StateManager:
                 created_at=datetime.utcnow().isoformat(),
             )
             self._save()
-            logger.info(f"Active trade set for {symbol}: {side} @ {entry_price}")
+            logger.info(f"Active trade set for {symbol} [{timeframe}]: {side} @ {entry_price}")
 
-    def check_and_clear_active_trade(self, symbol: str, current_price: float) -> Optional[str]:
+    def check_and_clear_active_trade(self, symbol: str, timeframe: str, current_price: float) -> Optional[str]:
         """Check if active trade hit TP/SL, clear if so. Returns exit reason or None."""
         with self._lock:
-            trade = self._active_trades.get(symbol)
+            key = _make_key(symbol, timeframe)
+            trade = self._active_trades.get(key)
             if not trade:
                 return None
 
             exit_reason = trade.check_exit(current_price)
             if exit_reason:
                 logger.info(
-                    f"Active trade for {symbol} hit {exit_reason}: "
+                    f"Active trade for {symbol} [{timeframe}] hit {exit_reason}: "
                     f"{trade.side} entry={trade.entry_price}, "
                     f"SL={trade.stop_loss}, TP={trade.take_profit}, "
                     f"current={current_price}"
                 )
-                del self._active_trades[symbol]
+                del self._active_trades[key]
                 self._save()
                 return exit_reason
 
             return None
 
-    def clear_active_trade(self, symbol: str) -> bool:
+    def clear_active_trade(self, symbol: str, timeframe: str) -> bool:
         """Manually clear active trade (e.g., on manual exit)."""
         with self._lock:
-            if symbol in self._active_trades:
-                del self._active_trades[symbol]
+            key = _make_key(symbol, timeframe)
+            if key in self._active_trades:
+                del self._active_trades[key]
                 self._save()
-                logger.info(f"Active trade cleared for {symbol}")
+                logger.info(f"Active trade cleared for {symbol} [{timeframe}]")
                 return True
             return False
 

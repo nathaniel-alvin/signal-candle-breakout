@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Optional, Callable
+from typing import Optional, Callable, List
 
 from src.core.config import get_settings
 
@@ -173,12 +173,111 @@ class CandleScheduler:
 
 
 def create_scheduler_from_config(settings: Optional["Settings"] = None) -> CandleScheduler:
-    """Create scheduler from global config."""
+    """Create scheduler from global config (uses first timeframe for backward compat)."""
     from src.core.config import get_settings
     settings = settings or get_settings()
+    primary_timeframe = settings.trading.timeframes[0] if settings.trading.timeframes else "1h"
     return CandleScheduler(
-        timeframe=settings.trading.timeframe,
+        timeframe=primary_timeframe,
         buffer_seconds=settings.scheduler.buffer_seconds,
         max_sleep_seconds=settings.scheduler.max_sleep_seconds,
         timezone_str=settings.scheduler.timezone,
     )
+
+
+class MultiTimeframeScheduler:
+    """Coordinates multiple CandleScheduler instances for multi-timeframe monitoring."""
+
+    def __init__(
+        self,
+        timeframes: List[str],
+        buffer_seconds: int = 3,
+        max_sleep_seconds: int = 3600,
+        timezone_str: str = "UTC"
+    ):
+        self.schedulers: Dict[str, CandleScheduler] = {}
+        for tf in timeframes:
+            self.schedulers[tf] = CandleScheduler(
+                timeframe=tf,
+                buffer_seconds=buffer_seconds,
+                max_sleep_seconds=max_sleep_seconds,
+                timezone_str=timezone_str
+            )
+        logger.info(f"MultiTimeframeScheduler initialized with timeframes: {list(self.schedulers.keys())}")
+
+    def get_next_wakeup(self) -> tuple[str, float]:
+        """
+        Get the earliest next candle close across all timeframes.
+
+        Returns:
+            Tuple of (timeframe, sleep_duration_seconds)
+        """
+        now = time.time()
+        earliest_tf = None
+        earliest_sleep = float('inf')
+
+        for tf, scheduler in self.schedulers.items():
+            sleep_duration = scheduler.get_sleep_duration(now)
+            if sleep_duration < earliest_sleep:
+                earliest_sleep = sleep_duration
+                earliest_tf = tf
+
+        return earliest_tf, earliest_sleep
+
+    def get_ready_timeframes(self, from_time: Optional[float] = None) -> List[str]:
+        """
+        Get list of timeframes that have candles closed at or before from_time.
+
+        Args:
+            from_time: Unix timestamp to check. Defaults to now.
+
+        Returns:
+            List of timeframes with newly closed candles
+        """
+        if from_time is None:
+            from_time = time.time()
+
+        ready = []
+        for tf, scheduler in self.schedulers.items():
+            next_close = scheduler.get_next_candle_close(from_time)
+            # If next_close is in the past (or equal), the candle just closed
+            if next_close <= from_time + scheduler.buffer_seconds:
+                ready.append(tf)
+
+        return ready
+
+    def sleep_until_next_any(self, shutdown_check: Optional[Callable[[], bool]] = None) -> List[str]:
+        """
+        Sleep until the earliest next candle close across all timeframes.
+
+        Args:
+            shutdown_check: Optional callable that returns True if shutdown requested.
+
+        Returns:
+            List of timeframes that just had candles close
+        """
+        tf, sleep_duration = self.get_next_wakeup()
+        scheduler = self.schedulers[tf]
+
+        next_close = time.time() + sleep_duration - scheduler.buffer_seconds
+        logger.debug(
+            f"Sleeping {sleep_duration:.2f}s until next candle close ({tf}) "
+            f"({datetime.fromtimestamp(next_close, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC)"
+        )
+
+        # Sleep in small chunks to allow interrupt checking
+        chunk_size = min(10.0, sleep_duration)
+        elapsed = 0.0
+        while elapsed < sleep_duration:
+            if shutdown_check and shutdown_check():
+                logger.debug("Sleep interrupted by shutdown signal")
+                break
+            chunk = min(chunk_size, sleep_duration - elapsed)
+            time.sleep(chunk)
+            elapsed += chunk
+
+        # After sleep, check which timeframes have closed candles
+        ready_tfs = self.get_ready_timeframes()
+        if ready_tfs:
+            logger.debug(f"Timeframes ready: {ready_tfs}")
+        return ready_tfs

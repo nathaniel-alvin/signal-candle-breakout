@@ -21,16 +21,26 @@ class ExchangeConfig(BaseModel):
 
 class TradingConfig(BaseModel):
     symbols: List[str] = Field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
-    timeframe: str = "1h"
+    timeframes: List[str] = Field(default_factory=lambda: ["1h"])
     fetch_limit: int = 100
 
-    @field_validator("timeframe")
+    @field_validator("timeframes")
     @classmethod
-    def validate_timeframe(cls, v: str) -> str:
-        valid = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"}
-        if v not in valid:
-            raise ValueError(f"Invalid timeframe: {v}. Must be one of {valid}")
-        return v
+    def validate_timeframes(cls, v: List[str]) -> List[str]:
+        valid = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"}
+        if not v:
+            raise ValueError("At least one timeframe must be specified")
+        for tf in v:
+            if tf not in valid:
+                raise ValueError(f"Invalid timeframe: {tf}. Must be one of {valid}")
+        # Remove duplicates while preserving order
+        seen = set()
+        unique = []
+        for tf in v:
+            if tf not in seen:
+                seen.add(tf)
+                unique.append(tf)
+        return unique
 
 
 class StrategyConfig(BaseModel):

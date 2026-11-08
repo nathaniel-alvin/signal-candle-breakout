@@ -6,11 +6,11 @@ import logging
 import signal
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from src.core.config import get_settings, Settings
 from src.core.state import StateManager
-from src.core.scheduler import CandleScheduler, create_scheduler_from_config
+from src.core.scheduler import CandleScheduler, MultiTimeframeScheduler, create_scheduler_from_config
 from src.data.fetcher import MarketDataFetcher, create_fetcher_from_config
 from src.strategy.breakout import BreakoutStrategy, BreakoutSignal, SignalType, create_strategy_from_config
 from src.notifications import NotificationManager, create_telegram_notifier_from_config, create_discord_notifier_from_config
@@ -32,14 +32,22 @@ class SignalBot:
             persist_enabled=self.settings.state.persist_enabled,
             settings=self.settings,
         )
+        # Multi-timeframe scheduler
+        self.multi_scheduler = MultiTimeframeScheduler(
+            timeframes=self.settings.trading.timeframes,
+            buffer_seconds=self.settings.scheduler.buffer_seconds,
+            max_sleep_seconds=self.settings.scheduler.max_sleep_seconds,
+            timezone_str=self.settings.scheduler.timezone,
+        )
+        # Keep single scheduler for backward compat (e.g., run_once)
         self.scheduler = create_scheduler_from_config(settings=self.settings)
         self.fetcher = create_fetcher_from_config(settings=self.settings)
         self.strategy = create_strategy_from_config(settings=self.settings)
         self.notification_manager = NotificationManager()
 
-        # Per-symbol circuit breaker: track consecutive failures
-        self._symbol_failures: Dict[str, int] = {s: 0 for s in self.settings.trading.symbols}
-        self._disabled_symbols: set = set()
+        # Per-(symbol, timeframe) circuit breaker: track consecutive failures
+        self._tf_failures: Dict[Tuple[str, str], int] = {}
+        self._disabled_tfs: Set[Tuple[str, str]] = set()
 
         # Setup notifiers
         self._setup_notifiers()
@@ -76,7 +84,7 @@ class SignalBot:
         logger.info("=" * 50)
         logger.info("🚀 Signal Bot Starting")
         logger.info(f"Symbols: {self.settings.trading.symbols}")
-        logger.info(f"Timeframe: {self.settings.trading.timeframe}")
+        logger.info(f"Timeframes: {self.settings.trading.timeframes}")
         logger.info(f"Strategy: Momentum Range Breakout")
         logger.info("=" * 50)
 
@@ -109,48 +117,52 @@ class SignalBot:
         logger.info("Signal Bot stopped")
 
     def _main_loop(self) -> None:
-        """Main polling loop."""
+        """Main polling loop - multi-timeframe aware."""
         while self.running and not self._shutdown_requested:
-            loop_start = time.time()
-
             try:
-                # Process each symbol
-                for symbol in self.settings.trading.symbols:
+                # Sleep until the earliest next candle close across all timeframes
+                ready_timeframes = self.multi_scheduler.sleep_until_next_any(
+                    shutdown_check=lambda: self._shutdown_requested
+                )
+
+                if self._shutdown_requested:
+                    break
+
+                # Process symbols for each ready timeframe
+                for tf in ready_timeframes:
                     if self._shutdown_requested:
                         break
-                    self._process_symbol(symbol)
+                    for symbol in self.settings.trading.symbols:
+                        if self._shutdown_requested:
+                            break
+                        self._process_symbol(symbol, tf)
 
             except Exception as e:
                 logger.error(f"Error in main loop iteration: {e}")
                 self._send_error_notification(f"Main loop error: {e}")
 
-            # Sleep until next candle (interruptible)
-            if self.running and not self._shutdown_requested:
-                self.scheduler.sleep_until_next_candle(
-                    shutdown_check=lambda: self._shutdown_requested
-                )
-
-    def _process_symbol(self, symbol: str) -> None:
-        """Process a single symbol: fetch data, evaluate strategy, send signals."""
-        # Skip disabled symbols
-        if symbol in self._disabled_symbols:
-            logger.debug(f"Skipping disabled symbol: {symbol}")
+    def _process_symbol(self, symbol: str, timeframe: str) -> None:
+        """Process a single symbol for a specific timeframe: fetch data, evaluate strategy, send signals."""
+        # Skip disabled (symbol, timeframe) pairs
+        tf_key = (symbol, timeframe)
+        if tf_key in self._disabled_tfs:
+            logger.debug(f"Skipping disabled symbol/timeframe: {symbol} [{timeframe}]")
             return
 
-        logger.debug(f"Processing {symbol}...")
+        logger.debug(f"Processing {symbol} [{timeframe}]...")
 
         try:
             # Fetch market data with freshness check
             df = self.fetcher.fetch_ohlcv_df(
                 symbol=symbol,
-                timeframe=self.settings.trading.timeframe,
+                timeframe=timeframe,
                 limit=self.settings.trading.fetch_limit,
                 max_candle_age_seconds=self.settings.max_candle_age_seconds,
             )
 
             if df.empty:
-                logger.warning(f"No data received for {symbol}")
-                self._record_failure(symbol)
+                logger.warning(f"No data received for {symbol} [{timeframe}]")
+                self._record_failure(symbol, timeframe)
                 return
 
             # Get latest complete candle timestamp
@@ -158,34 +170,35 @@ class SignalBot:
             candle_timestamp = int(latest_complete.name.timestamp() * 1000)  # ms
 
             # Check if we already processed this candle
-            if not self.state_manager.is_new_candle(symbol, candle_timestamp):
-                logger.debug(f"Candle already processed for {symbol}")
+            if not self.state_manager.is_new_candle(symbol, timeframe, candle_timestamp):
+                logger.debug(f"Candle already processed for {symbol} [{timeframe}]")
                 return
 
             # Check for active trade (prevent consecutive signals)
             if self.settings.state.prevent_consecutive_signals:
-                active_trade = self.state_manager.get_active_trade(symbol)
+                active_trade = self.state_manager.get_active_trade(symbol, timeframe)
                 if active_trade:
                     # Check if active trade hit TP/SL
                     current_price = float(df.iloc[-1]["close"])  # forming candle close
-                    exit_reason = self.state_manager.check_and_clear_active_trade(symbol, current_price)
+                    exit_reason = self.state_manager.check_and_clear_active_trade(symbol, timeframe, current_price)
                     if exit_reason:
-                        logger.info(f"Active trade for {symbol} closed: {exit_reason}")
+                        logger.info(f"Active trade for {symbol} [{timeframe}] closed: {exit_reason}")
                         self._send_trade_exit_notification(symbol, active_trade, exit_reason, current_price)
                     else:
-                        logger.debug(f"Active trade exists for {symbol}, skipping new signal")
+                        logger.debug(f"Active trade exists for {symbol} [{timeframe}], skipping new signal")
                         return
 
             # Evaluate strategy
-            signal = self.strategy.evaluate(df, symbol, self.settings.trading.timeframe)
+            signal = self.strategy.evaluate(df, symbol, timeframe)
 
             if signal.is_valid() and signal.levels:
                 # New signal generated!
-                logger.info(f"✅ New {signal.signal_type.value} signal for {symbol}")
+                logger.info(f"✅ New {signal.signal_type.value} signal for {symbol} [{timeframe}]")
 
                 # Update state
                 self.state_manager.update_candle_state(
                     symbol=symbol,
+                    timeframe=timeframe,
                     timestamp=candle_timestamp,
                     close_price=float(latest_complete["close"]),
                 )
@@ -194,6 +207,7 @@ class SignalBot:
                 if self.settings.state.track_active_trades:
                     self.state_manager.set_active_trade(
                         symbol=symbol,
+                        timeframe=timeframe,
                         side=signal.levels.side.value,
                         entry_price=signal.levels.entry,
                         stop_loss=signal.levels.stop_loss,
@@ -210,41 +224,44 @@ class SignalBot:
                 # No signal, still update candle state to prevent re-processing
                 self.state_manager.update_candle_state(
                     symbol=symbol,
+                    timeframe=timeframe,
                     timestamp=candle_timestamp,
                     close_price=float(latest_complete["close"]),
                 )
-                logger.debug(f"No signal for {symbol}")
+                logger.debug(f"No signal for {symbol} [{timeframe}]")
 
             # Success - reset failure counter
-            self._record_success(symbol)
+            self._record_success(symbol, timeframe)
 
         except Exception as e:
-            logger.error(f"Error processing {symbol}: {e}")
-            self._record_failure(symbol)
+            logger.error(f"Error processing {symbol} [{timeframe}]: {e}")
+            self._record_failure(symbol, timeframe)
 
-    def _record_success(self, symbol: str) -> None:
+    def _record_success(self, symbol: str, timeframe: str) -> None:
         """Reset failure counter on successful processing."""
-        if self._symbol_failures.get(symbol, 0) > 0:
-            logger.debug(f"Symbol {symbol} recovered after {self._symbol_failures[symbol]} failures")
-        self._symbol_failures[symbol] = 0
+        tf_key = (symbol, timeframe)
+        if self._tf_failures.get(tf_key, 0) > 0:
+            logger.debug(f"Symbol {symbol} [{timeframe}] recovered after {self._tf_failures[tf_key]} failures")
+        self._tf_failures[tf_key] = 0
 
-    def _record_failure(self, symbol: str) -> None:
-        """Track consecutive failures; disable symbol if threshold exceeded."""
-        self._symbol_failures[symbol] = self._symbol_failures.get(symbol, 0) + 1
-        failures = self._symbol_failures[symbol]
-        logger.warning(f"Symbol {symbol} failure #{failures}")
+    def _record_failure(self, symbol: str, timeframe: str) -> None:
+        """Track consecutive failures; disable symbol/timeframe if threshold exceeded."""
+        tf_key = (symbol, timeframe)
+        self._tf_failures[tf_key] = self._tf_failures.get(tf_key, 0) + 1
+        failures = self._tf_failures[tf_key]
+        logger.warning(f"Symbol {symbol} [{timeframe}] failure #{failures}")
 
         if failures >= self.settings.max_consecutive_failures:
-            self._disabled_symbols.add(symbol)
+            self._disabled_tfs.add(tf_key)
             logger.error(
-                f"Symbol {symbol} disabled after {failures} consecutive failures. "
+                f"Symbol {symbol} [{timeframe}] disabled after {failures} consecutive failures. "
                 f"Max allowed: {self.settings.max_consecutive_failures}. "
                 f"Restart bot or reload config to re-enable."
             )
-            # Send notification about disabled symbol
+            # Send notification about disabled symbol/timeframe
             self.notification_manager.send_message(
-                f"⚠️ **Symbol Disabled**\n"
-                f"`{symbol}` disabled after {failures} consecutive failures. "
+                f"⚠️ **Symbol/Timeframe Disabled**\n"
+                f"`{symbol}` [{timeframe}] disabled after {failures} consecutive failures. "
                 f"Check logs and restart to re-enable."
             )
 
@@ -254,7 +271,7 @@ class SignalBot:
             "🤖 **Signal Bot Started**\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"**Symbols:** {', '.join(self.settings.trading.symbols)}\n"
-            f"**Timeframe:** {self.settings.trading.timeframe}\n"
+            f"**Timeframes:** {', '.join(self.settings.trading.timeframes)}\n"
             f"**Strategy:** Momentum Range Breakout\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Monitoring for breakout signals..."
@@ -293,23 +310,27 @@ class SignalBot:
         )
         self.notification_manager.send_message(message)
 
-    def run_once(self) -> Dict[str, BreakoutSignal]:
-        """Run a single iteration for all symbols (for testing)."""
+    def run_once(self) -> Dict[str, Dict[str, BreakoutSignal]]:
+        """Run a single iteration for all symbols and timeframes (for testing)."""
         results = {}
         for symbol in self.settings.trading.symbols:
-            try:
-                df = self.fetcher.fetch_ohlcv_df(
-                    symbol=symbol,
-                    timeframe=self.settings.trading.timeframe,
-                    limit=self.settings.trading.fetch_limit,
-                    max_candle_age_seconds=self.settings.max_candle_age_seconds,
-                )
-                if not df.empty:
-                    signal = self.strategy.evaluate(df, symbol, self.settings.trading.timeframe)
-                    results[symbol] = signal
-            except Exception as e:
-                logger.error(f"Error in run_once for {symbol}: {e}")
-                results[symbol] = None
+            results[symbol] = {}
+            for timeframe in self.settings.trading.timeframes:
+                try:
+                    df = self.fetcher.fetch_ohlcv_df(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        limit=self.settings.trading.fetch_limit,
+                        max_candle_age_seconds=self.settings.max_candle_age_seconds,
+                    )
+                    if not df.empty:
+                        signal = self.strategy.evaluate(df, symbol, timeframe)
+                        results[symbol][timeframe] = signal
+                    else:
+                        results[symbol][timeframe] = None
+                except Exception as e:
+                    logger.error(f"Error in run_once for {symbol} [{timeframe}]: {e}")
+                    results[symbol][timeframe] = None
         return results
 
 
